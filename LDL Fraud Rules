@@ -1,0 +1,146 @@
+CREATE OR REPLACE TEMPORARY TABLE CB_INFO AS (
+    SELECT 
+        ACAP_REFR_ID, CB_KEY, EXSUBIND, SUBIND, CBCODE, 
+        MAX(KEYHTNBR) OVER (PARTITION BY ACAP_REFR_ID ORDER BY REQTS DESC)::NUMERIC AS KEYHTNBR,
+        CASE 
+            WHEN EXSUBIND = 'J' THEN MAX(KEYHTNBR) OVER (PARTITION BY ACAP_REFR_ID ORDER BY REQTS DESC)::NUMERIC - 2
+            ELSE MAX(KEYHTNBR) OVER (PARTITION BY ACAP_REFR_ID ORDER BY REQTS DESC)::NUMERIC END AS PRI_CB_SEQ_NO,
+        CASE 
+            WHEN EXSUBIND = 'J' THEN MAX(KEYHTNBR) OVER (PARTITION BY ACAP_REFR_ID ORDER BY REQTS DESC)::NUMERIC - 1
+            WHEN EXSUBIND = 'S' THEN MAX(KEYHTNBR) OVER (PARTITION BY ACAP_REFR_ID ORDER BY REQTS DESC)::NUMERIC
+            ELSE NULL END AS SEC_CB_SEQ_NO,
+        MAX(REQTS) OVER (PARTITION BY ACAP_REFR_ID ORDER BY REQTS DESC)::TIMESTAMP AS REQTS
+    FROM SA.RR_BL
+    WHERE DATE(REQTS)::DATE >= '2025-01-01' :: DATE - 30
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ACAP_REFR_ID ORDER BY REQTS DESC) = 1
+);
+
+CREATE OR REPLACE TEMPORARY TABLE APP_DRIVER_CB AS (
+    SELECT A.*, B.CB_KEY, PRI_CB_SEQ_NO, SEC_CB_SEQ_NO,
+        CASE WHEN LOAN_PROD_CD_PLR = 'PU' THEN 'Unsecured' WHEN LOAN_PROD_CD_PLR IN ('A1','P1','A2','P2','A3','P3','A4','P4','P5','P6','PP','PS') THEN 'Secured' END AS LOAN_TYPE,
+        CASE
+            WHEN sl_sec0051 <= 996.5 AND aut8132 > 1532.5 AND aut8132 < 99990 THEN 'Yes'
+            ELSE 'No' END AS high_secure_flag,
+        CASE
+            WHEN aut5122 > 0 AND aut5122 < 999999990 THEN aut5122
+            ELSE 0 END AS open_auto_bal
+    FROM BDM.APP_LOAN_PRODUCTION A
+    LEFT JOIN CB_INFO B ON A.ACAP_REFR_ID = B.ACAP_REFR_ID
+    LEFT JOIN SA.CB_ATTR_ATB_ATB03 C ON B.CB_KEY = C.CB_KEY AND B.PRI_CB_SEQ_NO = C.CB_SEQ_NO AND C.RECORD_CREATED_TIMESTAMP >= '2025-01-01'::DATE - 30
+    LEFT JOIN sa.cb_attr_atb_atb04 D ON B.cb_key = D.cb_key AND B.pri_cb_seq_no = D.cb_seq_no AND D.record_created_timestamp >= '2025-01-01'::DATE - 30
+    LEFT JOIN sa.cb_attr_atb_atb02 E ON B.cb_key = E.cb_key AND B.pri_cb_seq_no = E.cb_seq_no AND E.record_created_timestamp >= '2025-01-01'::DATE - 30
+    WHERE APPL_ENTRY_DT BETWEEN '2025-01-01' AND '2026-03-31' AND CORE_V_CAPP = 'Core' AND CUST_TYPE IN ('NC', 'FC')
+);
+
+CREATE OR REPLACE TEMPORARY TABLE APP_DRIVER_FINAL AS (
+    SELECT A.*, 
+        CASE WHEN B.RSN_CD = 'CP' THEN 'T' WHEN B.RSN_CD = 'CG' THEN 'C' END AS STARTING_TC,
+        case when C.rsn_cd = 'FD' then 'T' when B.rsn_cd = 'CG' and D.rsn_cd is null then 'C' else 'E' end as final_tc, 
+        hit_KYC_Address, hit_KYC_ID, hit_IDA_CUT, hit_IDA_RESPONSE, hit_fdc_rsn_BR, fnl_ndi, ID_SCORE,
+        P_NM_FRST || ' ' || P_NM_LST AS FULL_NM
+    FROM APP_DRIVER_CB A
+    LEFT JOIN (
+        SELECT APPL_KEY, ACAP_REFR_ID, RSN_CD FROM q1.rr_strgy_rsn WHERE RSN_CD IN ('CP', 'CG')
+        QUALIFY row_number() over (partition by appl_key order by sc_ts desc) = 1
+    ) B on A.appl_key = B.appl_key
+    LEFT JOIN (
+        SELECT APPL_KEY, ACAP_REFR_ID, RSN_CD FROM q1.rr_strgy_rsn WHERE RSN_CD = 'FD'
+        QUALIFY row_number() over (partition by appl_key order by sc_ts desc) = 1
+    ) C ON A.APPL_KEY = C.APPL_KEY
+    LEFT JOIN (
+        SELECT APPL_KEY, ACAP_REFR_ID, RSN_CD FROM q1.rr_strgy_rsn WHERE RSN_CD IN ('11','12','15','16','BR')
+        QUALIFY row_number() over (partition by appl_key order by sc_ts desc) = 1
+    ) D ON A.APPL_KEY = D.APPL_KEY
+    LEFT JOIN (
+        select 
+            appl_key,
+            max(case when trim(rsn_cd) = '11' and rsn_no > 0 then 1 else 0 end) as hit_KYC_Address,
+            max(case when trim(rsn_cd) = '12' and rsn_no > 0 then 1 else 0 end) as hit_KYC_ID,
+            max(case when trim(rsn_cd) = '15' and rsn_no > 0 then 1 else 0 end) as hit_IDA_CUT,
+            max(case when trim(rsn_cd) = '16' and rsn_no > 0 then 1 else 0 end) as hit_IDA_RESPONSE,
+            max(case when trim(rsn_cd) = 'BR' and rsn_no > 0 then 1 else 0 end) as hit_fdc_rsn_BR
+        from q1.rr_strgy_rsn
+        group by 1 
+    ) E on A.appl_key = E.appl_key
+    LEFT JOIN q1.rr_strgy_dsr_id_analytics F on A.ACAP_REFR_ID = F.ACAP_REFR_ID
+    LEFT JOIN (
+        SELECT APPL_KEY, ACAP_REFR_ID, FNL_NDI FROM q1.rr_strgy_mstr 
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY APPL_KEY ORDER BY SC_TS DESC) = 1
+    ) G ON A.APPL_KEY = G.APPL_KEY
+);
+
+SELECT * FROM APP_DRIVER_FINAL ORDER BY (P_NM_FRST || ' ' || P_NM_LST);
+SELECT COUNT(*), COUNT(APPL_KEY), COUNT(DISTINCT APPL_KEY), COUNT(SSN_KEY_PRIM), COUNT(DISTINCT SSN_KEY_PRIM) FROM APP_DRIVER_FINAL;
+SELECT * FROM APP_DRIVER_FINAL WHERE SSN_KEY_PRIM IS NULL;
+
+
+
+
+SELECT 
+    --MONTH(APPL_ENTRY_DT) AS APP_MONTH,
+    STARTING_TC, FINAL_TC, 
+    -- CASE WHEN hit_KYC_Address = 1 OR hit_KYC_ID = 1 OR hit_IDA_CUT = 1 OR hit_IDA_RESPONSE = 1 OR hit_fdc_rsn_BR THEN 1 ELSE 0 END AS FRAUD_FLAG_IND,
+    CASE WHEN HIT_KYC_ID = 1 AND hit_KYC_Address = 0 AND hit_IDA_CUT = 0 AND hit_IDA_RESPONSE = 0 AND hit_fdc_rsn_BR = 0 THEN 1 ELSE 0 END AS FRAUD_KYC_ID_ONLY,
+    CASE WHEN HIT_KYC_ID = 1 AND (hit_KYC_Address = 1 OR hit_IDA_CUT = 1 OR hit_IDA_RESPONSE = 1 OR hit_fdc_rsn_BR = 1) THEN 1 ELSE 0 END AS FRAUD_OTHER,
+    COUNT(DISTINCT APPL_KEY) AS APP_CT, 
+    RATIO_TO_REPORT(APP_CT) OVER () AS APP_PERC,
+    COUNT(DISTINCT CASE WHEN ACCT_KEY > 0 THEN APPL_KEY END) AS ACCT_CT,
+    ACCT_CT / APP_CT AS PTR,
+    AVG(CASE WHEN ACCT_KEY > 0 THEN NEW_MONEY END) AS AVG_NM,
+    MIN(APPL_ENTRY_DT), MAX(APPL_ENTRY_DT)
+FROM --APP_DRIVER_FINAL
+(
+    SELECT * FROM APP_DRIVER_FINAL QUALIFY ROW_NUMBER() OVER (PARTITION BY SSN_KEY_PRIM ORDER BY APPL_ENTRY_DT DESC) = 1
+)
+WHERE 1 = 1
+    AND CHANNEL <> 'Branch'
+    AND ((RSK_LVL = 'S' AND CRDT_LMT_RQST_AM <= 5000) OR (RSK_LVL = 'P' AND CRDT_LMT_RQST_AM <= 3000))
+    AND INCOME_DISCLOSED_TOTAL < 100000/12
+    AND IAPS_SRC_CD <> '31507'
+    AND (HIGH_SECURE_FLAG <> 'Y' OR OPEN_AUTO_BAL >= 15000)
+    AND ID_SCORE < 800 
+    AND FNL_NDI > 500
+    AND OFFER_TYPE IN ('multi offer', 'SDL', 'sec only')
+    AND STARTING_TC IS NOT NULL
+    -- AND FINAL_TC <> 'E'
+    AND APPL_ENTRY_DT BETWEEN '2026-02-01' AND '2026-02-28'
+GROUP BY 1, 2, 3, 4--, 5 
+ORDER BY 1, 2, 3, 4--, 5
+;
+
+SELECT COUNT(DISTINCT APPL_KEY) / 12 AS MONTHLY_APP_CT
+FROM (SELECT * FROM APP_DRIVER_FINAL QUALIFY ROW_NUMBER() OVER (PARTITION BY SSN_KEY_PRIM ORDER BY APPL_ENTRY_DT DESC) = 1)
+WHERE 1 = 1
+    AND CHANNEL <> 'Branch'
+    AND ((RSK_LVL = 'S' AND CRDT_LMT_RQST_AM <= 5000) OR (RSK_LVL = 'P' AND CRDT_LMT_RQST_AM <= 3000))
+    AND INCOME_DISCLOSED_TOTAL < 100000/12
+    AND IAPS_SRC_CD <> '31507'
+    AND (HIGH_SECURE_FLAG <> 'Y' OR OPEN_AUTO_BAL >= 15000)
+    AND ID_SCORE < 800 
+    AND FNL_NDI > 500
+    AND OFFER_TYPE IN ('multi offer', 'SDL', 'sec only')
+    AND APPL_ENTRY_DT BETWEEN '2025-01-01' AND '2025-12-31'
+;
+
+SELECT 
+    FINAL_TC, 
+    COUNT(DISTINCT APPL_KEY) AS APP_CT, 
+    COUNT(DISTINCT CASE WHEN LOAN_TYPE = 'Unsecured' AND ACCT_KEY > 0 THEN APPL_KEY END) AS UNS_CT,
+    COUNT(DISTINCT CASE WHEN LOAN_TYPE = 'Secured' AND ACCT_KEY > 0 THEN APPL_KEY END) AS SEC_CT,
+    UNS_CT / APP_CT AS UNS_PTR,
+    SEC_CT / APP_CT AS SEC_PTR,
+    UNS_PTR + SEC_PTR AS TOTAL_PTR
+FROM (SELECT * FROM APP_DRIVER_FINAL QUALIFY ROW_NUMBER() OVER (PARTITION BY SSN_KEY_PRIM ORDER BY APPL_ENTRY_DT DESC) = 1)
+WHERE 1 = 1
+    AND CHANNEL <> 'Branch'
+    AND ((RSK_LVL = 'S' AND CRDT_LMT_RQST_AM <= 5000) OR (RSK_LVL = 'P' AND CRDT_LMT_RQST_AM <= 3000))
+    AND INCOME_DISCLOSED_TOTAL < 100000/12
+    AND IAPS_SRC_CD <> '31507'
+    AND (HIGH_SECURE_FLAG <> 'Y' OR OPEN_AUTO_BAL >= 15000)
+    AND ID_SCORE < 800 
+    AND FNL_NDI > 500
+    AND OFFER_TYPE IN ('multi offer', 'SDL', 'sec only')
+    AND APPL_ENTRY_DT BETWEEN '2026-02-01' AND '2026-02-28'
+    AND STARTING_TC IS NOT NULL AND FINAL_TC IN ('T', 'C')
+GROUP BY 1
+ORDER BY 1;
